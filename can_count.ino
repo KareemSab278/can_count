@@ -1,36 +1,158 @@
 #include <Wire.h>
 #include "Adafruit_VL53L0X.h"
 
+Adafruit_VL53L0X sensors[NUM_SECTIONS];
 
-/*
-    This project should be able to count the number of cans in a set.
-    Thinking of generating some sort of matrix grid and showing available sections for the cans
+bool listening = false;
+unsigned long lastUpdateTime = 0;
 
-    there will be one sensor in the back of the can section to count how mamy cans are in
-        (less distance to first can meams more cans in)
 
-    the sensors will all work together to return the total count of each can in each section in unparsed json.
+const int NUM_SECTIONS = 1;
+const unsigned long UPDATE_INTERVAL_MS = 1000;
+const int XSHUT_PINS[NUM_SECTIONS] = {2}; // unique i2c pins for each sensor
+const uint8_t SENSOR_ADDRESSES[NUM_SECTIONS] = {0x30}; // unique I2C address for each sensor
+const float ONE_CAN_DISTANCE_MM[NUM_SECTIONS] = {495.0}; // how much distance a can takes
+const float CAN_PITCH_MM[NUM_SECTIONS] = {61.0}; // distance of can pitch
+const float EMPTY_THRESHOLD_MM[NUM_SECTIONS] = {520.0}; // distance considered empty
 
-    data looks like: 
+
+
+void initSensors()
+{
+  for (int i = 0; i < NUM_SECTIONS; i++)
+  {
+    pinMode(XSHUT_PINS[i], OUTPUT);
+    digitalWrite(XSHUT_PINS[i], LOW);
+  }
+
+  delay(10);
+
+  for (int i = 0; i < NUM_SECTIONS; i++)
+  {
+    digitalWrite(XSHUT_PINS[i], HIGH);
+    delay(10);
+
+    if (!sensors[i].begin(SENSOR_ADDRESSES[i], false, &Wire))
     {
-        "section_1": 5, // section_1 can count is 5
-        "section_2": 3,
-        "section_3": 7
+      Serial.print("{\"error\": \"sensor_");
+      Serial.print(i + 1);
+      Serial.println("_init_failed\"}");
+    }
+  }
+}
+
+
+
+
+int calculateCanCount(int section, uint16_t distance)
+{
+  if (distance >= EMPTY_THRESHOLD_MM[section])
+  {
+    return 0;
+  }
+
+  float difference = ONE_CAN_DISTANCE_MM[section] - (float)distance;
+  int additionalCans = round(difference / CAN_PITCH_MM[section]);
+
+  int count = 1 + additionalCans;
+
+  if (count < 0)
+  {
+    count = 0;
+  }
+
+  return count;
+}
+
+
+
+
+void sendCanCounts()
+{
+  Serial.print("{");
+
+  for (int i = 0; i < NUM_SECTIONS; i++)
+  {
+    VL53L0X_RangingMeasurementData_t measure;
+    sensors[i].rangingTest(&measure, false);
+
+    int count = 0;
+
+    if (measure.RangeStatus != 4)
+    {
+      count = calculateCanCount(i, measure.RangeMilliMeter);
     }
 
-    This should be returned every second depending on the hardware capabilities.
+    Serial.print("\"section_");
+    Serial.print(i + 1);
+    Serial.print("\": ");
+    Serial.print(count);
 
-    it uses a VL53L0X time-of-flight distance sensor to measure the distance to the first can in each section.
-    it uses the arduino uno Q board for interfacing with the sensors and handling serial communication with the frontend.
+    if (i < NUM_SECTIONS - 1)
+    {
+      Serial.print(", ");
+    }
+  }
 
-    There is a limitation however, the very last can in the section (meaning only 1 can left) may not be accurately detected by the sensor.
-    because it fits a small space. i will try however to get the most accurate reading possible by possibly measuring the distance past the can.
+  Serial.println("}");
+}
 
-    the can count will be provided to the frontend. but only when the frontend requests the information.
-    so this code must listen to the frontned using usb serial comms when it sends a request for the can count.
-    
-    commands:
-    LISTEN_CAN_COUNT: command sent by the frontend to start listening for can count updates irt
-    STOP: command sent by the frontend to stop listening for can count updates
-*/
 
+
+
+void handleSerial()
+{
+  static String command = "";
+
+  while (Serial.available())
+  {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r')
+    {
+      command.trim();
+
+      if (command == "LISTEN_CAN_COUNT")
+      {
+        listening = true;
+      }
+      else if (command == "STOP")
+      {
+        listening = false;
+      }
+
+      command = "";
+    }
+    else
+    {
+      command += c;
+    }
+  }
+}
+
+
+
+
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial) { }
+
+  Wire.begin();
+
+  initSensors();
+}
+
+
+
+
+void loop()
+{
+  handleSerial();
+
+  if (listening && millis() - lastUpdateTime >= UPDATE_INTERVAL_MS)
+  {
+    lastUpdateTime = millis();
+    sendCanCounts();
+  }
+}
