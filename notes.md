@@ -29,5 +29,7 @@
     commands:
     LISTEN_CAN_COUNT: command sent by the frontend to start listening for can count updates irt
     STOP: command sent by the frontend to stop listening for can count updates
+
+    Ill probably have to turn the thing off by sending stop to it
 */
 ```
