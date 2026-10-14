@@ -153,8 +153,10 @@ void initSensors() {
             continue;
         }
 
+        delay(300);
+
         sensors[i].setDistanceMode(VL53L1X::Long);
-        sensors[i].setMeasurementTimingBudget(50000);
+        // sensors[i].setMeasurementTimingBudget(100000);
         sensors[i].startContinuous(50);
 
         sensorReady[i] = true;
