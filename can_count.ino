@@ -170,7 +170,7 @@ void sendDistances() {
 
     float distance = getLiveDistance(i);
 
-    int row_id = sensorInfo[i].muxAddress - MUX_MIN_ADDRESS + 1;
+    int row_id = sensorInfo[i].muxAddress - MUX_MIN_ADDRESS;
 
     Serial.print("{\"row_id\":");
     Serial.print(row_id);
