@@ -21,6 +21,7 @@
 const uint8_t MUX_MIN_ADDRESS = 0x70;
 const uint8_t MUX_MAX_ADDRESS = 0x77;
 
+// for each 0 - 7 show shelf number -> row_id : 0 == 1
 const int CHANNELS_PER_MULTIPLEXER = 8;
 const int NUM_OF_MULTIPLEXERS = 8;
 
@@ -169,8 +170,13 @@ void sendDistances() {
 
     float distance = getLiveDistance(i);
 
-    Serial.print("{\"channel\":");
-    Serial.print(i + 1);
+    int row_id = sensorInfo[i].muxAddress - MUX_MIN_ADDRESS + 1;
+
+    Serial.print("{\"row_id\":");
+    Serial.print(row_id);
+
+    Serial.print(",\"channel\":");
+    Serial.print(sensorInfo[i].channel);
 
     Serial.print(",\"live_distance\":");
 
