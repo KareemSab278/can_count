@@ -1,436 +1,245 @@
+/*
+  ESP32 - PLUG AND PLAY DISTANCE SYSTEM
+  can connect 64 VL53L1X sensors maximum using TCA9548A multiplexers at addresses 0x70–0x77.
+
+  this sends data over serial looking like:
+  [{"channel":1,"live_distance":548.00},{"channel":2,"live_distance":503.00}]
+  [{"channel":1,"live_distance":543.00},{"channel":2,"live_distance":501.00}]
+  [{"channel":1,"live_distance":547.00},{"channel":2,"live_distance":501.00}]
+
+  the frontend will then get the data and identify what was taken out based on distance differences using TS code
+*/
+
 #include <Wire.h>
 #include <VL53L1X.h>
-#include <map>
-#include <utility>
-#include <math.h>
 
-// ============================================================
-// TCA9548A CONFIG
-// ============================================================
+#define I2C_SDA 21
+#define I2C_SCL 22
 
-#define MUX_ADDRESS 0x70
+#define SENSOR_ADDRESS 0x29
 
-// Sensor 0 -> TCA channel 2
-// Sensor 1 -> TCA channel 3
-const uint8_t SENSOR_CHANNELS[2] = {2, 3};
-const uint8_t SENSOR_ADDRESS = 0x29;
+const uint8_t MUX_MIN_ADDRESS = 0x70;
+const uint8_t MUX_MAX_ADDRESS = 0x77;
 
-// ============================================================
-// CAN COUNT MAP
-// ============================================================
+const int CHANNELS_PER_MULTIPLEXER = 8;
+const int NUM_OF_MULTIPLEXERS = 8;
 
-// for the older sensor
-// const std::map<std::pair<float, float>, int> canCountMap = {
-//     {{540.0, 590.0}, 0},
-//     {{510.0, 535.0}, 1},
-//     {{430.0, 460.0}, 2},
-//     {{385.0, 390.0}, 3},
-//     {{305.0, 315.0}, 4},
-//     {{230.0, 240.0}, 5},
-//     {{165.0, 170.0}, 6},
-//     {{84.0, 85.0},  7}
-// };
-
-// for the new sensor:
-const std::map<std::pair<float, float>, int> canCountMap = {
-    {{500.0, 1000.0}, 0},
-    {{450.0, 470.0},  1},
-    {{390.0, 410.0},  2},
-    {{335.0, 350.0},  3},
-    {{270.0, 280.0},  4},
-    {{230.0, 240.0},  5},
-    {{125.0, 130.0},  6},
-    {{60.0, 70.0},    7}
-};
-// ============================================================
-// SERIAL / LISTENING
-// ============================================================
-
-bool listening = false;
-bool listeningRaw = false;
-
-unsigned long lastUpdateTime = 0;
-unsigned long lastRawUpdateTime = 0;
-
-const char CMD_START[] = "start";
-const char CMD_STOP[] = "stop";
-const char CMD_LISTEN_RAW[] = "listen_raw";
-
-// ============================================================
-// SENSOR CONFIG
-// ============================================================
-
-const int NUM_COLUMNS = 2;
+// get the maximum number of channels per multiplexers
+const int MAX_SENSORS = CHANNELS_PER_MULTIPLEXER * NUM_OF_MULTIPLEXERS;
 
 const unsigned long UPDATE_INTERVAL_MS = 1000;
 
-const float ONE_CAN_DISTANCE_MM[NUM_COLUMNS] = {
-    530.0, 530.0
+struct SensorInfo {
+  uint8_t muxAddress;
+  uint8_t channel;
+  bool ready;
 };
 
-const float CAN_PITCH_MM[NUM_COLUMNS] = {
-    61.0, 61.0
-};
+SensorInfo sensorInfo[MAX_SENSORS];
+VL53L1X sensors[MAX_SENSORS];
 
-const float EMPTY_BAND_MIN_MM[NUM_COLUMNS] = {
-    520.0, 520.0
-};
+int sensorCount = 0;
 
-const int NUM_READINGS = 10;
+bool listening = false;
+unsigned long lastUpdateTime = 0;
 
-// ============================================================
-// VL53L1X OBJECTS
-// ============================================================
+const char CMD_START[] = "start";
+const char CMD_STOP[] = "stop";
 
-VL53L1X sensors[NUM_COLUMNS];
 
-bool sensorReady[NUM_COLUMNS] = {false, false};
-
-// ============================================================
-// TCA9548A
-// ============================================================
-
-void selectChannel(uint8_t channel) {
-    Wire.beginTransmission(MUX_ADDRESS);
-    Wire.write(1 << channel);
-    Wire.endTransmission();
-
-    delay(2);
+bool muxExists(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
 }
 
-// ============================================================
-// CHECK SENSOR
-// ============================================================
 
-bool sensorExists(uint8_t channel) {
-    selectChannel(channel);
+void selectChannel(uint8_t muxAddress, uint8_t channel) {
+  Wire.beginTransmission(muxAddress);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
 
-    Wire.beginTransmission(SENSOR_ADDRESS);
-    return Wire.endTransmission() == 0;
+  delay(2);
 }
 
-// ============================================================
-// INITIALISE SENSORS
-// ============================================================
+
+bool sensorExists(uint8_t muxAddress, uint8_t channel) {
+  selectChannel(muxAddress, channel);
+
+  Wire.beginTransmission(SENSOR_ADDRESS);
+  return Wire.endTransmission() == 0;
+}
+
 
 void initSensors() {
-    Wire.beginTransmission(MUX_ADDRESS);
+  for (uint8_t mux = MUX_MIN_ADDRESS;
+       mux <= MUX_MAX_ADDRESS;
+       mux++) {
 
-    if (Wire.endTransmission() != 0) {
-        Serial.println("{\"error\":\"tca9548a_not_found\"}");
+    if (!muxExists(mux)) {
+      continue;
+    }
+
+    Serial.printf(
+      "{\"status\":\"mux_found\",\"mux\":%u}\n",
+      mux);
+
+    for (uint8_t channel = 0;
+         channel < CHANNELS_PER_MULTIPLEXER;
+         channel++) {
+
+      if (sensorCount >= MAX_SENSORS) {
+        Serial.println("{\"status\":\"sensor_limit_reached\"}");
         return;
+      }
+
+      if (!sensorExists(mux, channel)) {
+        continue;
+      }
+
+      int index = sensorCount;
+
+      sensors[index].setBus(&Wire);
+      sensors[index].setTimeout(500);
+
+      if (!sensors[index].init()) {
+        Serial.printf(
+          "{\"error\":\"sensor_init_failed\",\"mux\":%u,\"channel\":%u}\n",
+          mux, channel);
+        continue;
+      }
+
+      sensors[index].setDistanceMode(VL53L1X::Long);
+      sensors[index].startContinuous(50);
+
+      sensorInfo[index].muxAddress = mux;
+      sensorInfo[index].channel = channel;
+      sensorInfo[index].ready = true;
+
+      sensorCount++;
+
+      Serial.printf(
+        "{\"status\":\"sensor_ready\",\"mux\":%u,\"channel\":%u}\n",
+        mux, channel);
     }
+  }
 
-    Serial.println("{\"status\":\"tca9548a_found\"}");
-
-    for (int i = 0; i < NUM_COLUMNS; i++) {
-        uint8_t channel = SENSOR_CHANNELS[i];
-
-        selectChannel(channel);
-
-        Serial.print("{\"sensor\":");
-        Serial.print(i + 1);
-        Serial.print(",\"channel\":");
-        Serial.print(channel);
-        Serial.print(",\"address\":\"0x29\",\"found\":");
-
-        if (!sensorExists(channel)) {
-            Serial.println("false}");
-            continue;
-        }
-
-        Serial.println("true}");
-
-        selectChannel(channel);
-
-        sensors[i].setBus(&Wire);
-        sensors[i].setTimeout(500);
-
-        if (!sensors[i].init()) {
-            Serial.print("{\"error\":\"sensor_");
-            Serial.print(i + 1);
-            Serial.println("_init_failed\"}");
-            continue;
-        }
-
-        delay(300);
-
-        sensors[i].setDistanceMode(VL53L1X::Long);
-        // sensors[i].setMeasurementTimingBudget(100000);
-        sensors[i].startContinuous(50);
-
-        sensorReady[i] = true;
-
-        Serial.print("{\"sensor\":");
-        Serial.print(i + 1);
-        Serial.println(",\"status\":\"ready\"}");
-    }
-}
-
-// ============================================================
-// GET MEDIAN DISTANCE
-// ============================================================
-
-float getAverageDistance(int column) {
-    if (column < 0 || column >= NUM_COLUMNS) {
-        return -1.0;
-    }
-
-    if (!sensorReady[column]) {
-        return -1.0;
-    }
-
-    selectChannel(SENSOR_CHANNELS[column]);
-
-    const int NUM_SAMPLES = 15;
-
-    float readings[NUM_SAMPLES];
-    int validReadings = 0;
-
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        uint16_t distance = sensors[column].read();
-
-        bool timedOut = sensors[column].timeoutOccurred();
-
-        bool validStatus =
-            sensors[column].ranging_data.range_status
-            == VL53L1X::RangeValid;
-
-        if (!timedOut && validStatus && distance > 0) {
-            readings[validReadings++] = distance;
-        }
-
-        delay(10);
-    }
-
-    if (validReadings == 0) {
-        return -1.0;
-    }
-
-    // Sort valid readings in ascending order.
-    for (int i = 0; i < validReadings - 1; i++) {
-        for (int j = i + 1; j < validReadings; j++) {
-            if (readings[j] < readings[i]) {
-                float temp = readings[i];
-                readings[i] = readings[j];
-                readings[j] = temp;
-            }
-        }
-    }
-
-    // Return median.
-    if (validReadings % 2 == 1) {
-        return readings[validReadings / 2];
-    }
-
-    return (
-        readings[validReadings / 2 - 1] +
-        readings[validReadings / 2]
-    ) / 2.0;
-}
-
-// ============================================================
-// CALCULATE CAN COUNT
-// ============================================================
-
-
-
-int calculateCanCount(int column, float distance) {
-    if (distance < 0) {
-        return 0;
-    }
-
-    for (const auto& entry : canCountMap) {
-        float minDistance = entry.first.first;
-        float maxDistance = entry.first.second;
-
-        if (distance >= minDistance && distance <= maxDistance) {
-            return entry.second;
-        }
-    }
-
-    int closestCount = 1;
-    float smallestDifference = 1e9;
-
-    for (const auto& entry : canCountMap) {
-        int count = entry.second;
-
-        if (count == 0) {
-            continue;
-        }
-
-        float midpoint =
-            (entry.first.first + entry.first.second) / 2.0;
-
-        float difference = fabs(distance - midpoint);
-
-        if (difference < smallestDifference) {
-            smallestDifference = difference;
-            closestCount = count;
-        }
-    }
-
-    return closestCount;
+  Serial.printf(
+    "{\"status\":\"scan_complete\",\"sensors_found\":%d}\n",
+    sensorCount);
 }
 
 
-// ============================================================
-// SEND CAN COUNTS
-// Atomic JSON line
-// ============================================================
+float getLiveDistance(int index) {
+  if (index < 0 || index >= sensorCount) {
+    return -1.0;
+  }
 
-void sendCanCounts() {
-    String json = "[";
+  if (!sensorInfo[index].ready) {
+    return -1.0;
+  }
 
-    for (int i = 0; i < NUM_COLUMNS; i++) {
-        float avgDistance = getAverageDistance(i);
+  uint8_t mux = sensorInfo[index].muxAddress;
+  uint8_t channel = sensorInfo[index].channel;
 
-        int count = 0;
+  selectChannel(mux, channel);
 
-        if (avgDistance >= 0) {
-            count = calculateCanCount(i, avgDistance);
-        }
+  uint16_t distance = sensors[index].read();
 
-        if (i > 0) {
-            json += ",";
-        }
+  bool timedOut = sensors[index].timeoutOccurred();
 
-        json += "{\"channel\":";
-        json += String(SENSOR_CHANNELS[i]);
+  bool validStatus =
+    sensors[index].ranging_data.range_status
+    == VL53L1X::RangeValid;
 
-        json += ",\"count\":";
-        json += String(count);
+  if (timedOut || !validStatus || distance == 0) {
+    return -1.0;
+  }
 
-        json += ",\"live_distance\":";
-
-        if (avgDistance < 0) {
-            json += "null";
-        } else {
-            json += String(avgDistance, 2);
-        }
-
-        json += "}";
-    }
-
-    json += "]";
-
-    Serial.println(json);
+  return distance;
 }
 
-// ============================================================
-// SEND RAW DISTANCES
-// Atomic JSON line
-// ============================================================
 
 void sendDistances() {
-    String json = "{";
+  Serial.print("[");
 
-    for (int i = 0; i < NUM_COLUMNS; i++) {
-        float avgDistance = getAverageDistance(i);
-
-        if (i > 0) {
-            json += ",";
-        }
-
-        json += "\"channel_";
-        json += String(SENSOR_CHANNELS[i]);
-        json += "\":";
-
-        if (avgDistance < 0) {
-            json += "null";
-        } else {
-            json += String(avgDistance, 2);
-        }
+  for (int i = 0; i < sensorCount; i++) {
+    if (i > 0) {
+      Serial.print(",");
     }
 
-    json += "}";
+    float distance = getLiveDistance(i);
 
-    Serial.println(json);
+    Serial.print("{\"channel\":");
+    Serial.print(i + 1);
+
+    Serial.print(",\"live_distance\":");
+
+    if (distance < 0) {
+      Serial.print("null");
+    } else {
+      Serial.print(distance, 2);
+    }
+
+    Serial.print("}");
+  }
+
+  Serial.println("]");
 }
 
-// ============================================================
-// SERIAL COMMAND HANDLER
-// ============================================================
 
 void handleSerial() {
-    static String command = "";
+  static String command = "";
 
-    while (Serial.available()) {
-        char c = Serial.read();
+  while (Serial.available()) {
+    char c = Serial.read();
 
-        if (c == '\n' || c == '\r') {
-            command.trim();
+    if (c == '\n' || c == '\r') {
+      command.trim();
 
-            if (command.equals(CMD_START)) {
-                listening = true;
-                lastUpdateTime = millis();
-
-                Serial.println("{\"status\":\"started\"}");
-
-            } else if (command.equals(CMD_STOP)) {
-                listening = false;
-                listeningRaw = false;
-
-                Serial.println("{\"status\":\"stopped\"}");
-
-            } else if (command.equals(CMD_LISTEN_RAW)) {
-                listeningRaw = true;
-                lastRawUpdateTime = millis();
-
-                Serial.println("{\"status\":\"raw_started\"}");
-
-            } else if (command.length() > 0) {
-                Serial.print(
-                    "{\"error\":\"unknown_command\",\"command\":\""
-                );
-                Serial.print(command);
-                Serial.println("\"}");
-            }
-
-            command = "";
-
-        } else {
-            command += c;
-        }
-    }
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
-void setup() {
-    Serial.begin(115200);
-
-    Wire.begin();
-
-    delay(100);
-
-    initSensors();
-}
-
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop() {
-    handleSerial();
-
-    // Normal can-count output.
-    if (listening &&
-        millis() - lastUpdateTime >= UPDATE_INTERVAL_MS) {
-
+      if (command.equals(CMD_START)) {
+        listening = true;
         lastUpdateTime = millis();
 
-        sendCanCounts();
+        Serial.println("{\"status\":\"started\"}");
+
+      } else if (command.equals(CMD_STOP)) {
+        listening = false;
+
+        Serial.println("{\"status\":\"stopped\"}");
+
+      } else if (command.length() > 0) {
+        Serial.println("{\"error\":\"unknown_command\"}");
+      }
+
+      command = "";
+
+    } else if (command.length() < 100) {
+      command += c;
     }
+  }
+}
 
-    // Raw distance output.
-    if (listeningRaw &&
-        millis() - lastRawUpdateTime >= UPDATE_INTERVAL_MS) {
 
-        lastRawUpdateTime = millis();
+void setup() {
+  Serial.begin(115200);
 
-        sendDistances();
-    }
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  delay(100);
+
+  initSensors();
+}
+
+
+void loop() {
+  handleSerial();
+
+  unsigned long now = millis();
+
+  if (listening && now - lastUpdateTime >= UPDATE_INTERVAL_MS) {
+
+    lastUpdateTime = now;
+
+    sendDistances();
+  }
 }
